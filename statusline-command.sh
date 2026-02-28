@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Claude Code status line: 2-line symmetric layout
+# Line 1: 대화  ━━━━━━━━──────────── 42%   ↑85.2K ↓12.3K         Opus 4.6
+# Line 2: 세션  ━━━━━━━━━━━━━━━───── 74%   11.2M / 15.0M       1h18m 남음
+# ─────────────────────────────────────────────────────────────────
+SESSION_TOKEN_LIMIT=15000000   # 15M tokens (Max 5x)
+
+input=$(cat)
+
+# --- Parse ---
+eval "$(echo "$input" | jq -r '
+  @sh "model=\(.model.display_name // "Unknown")",
+  @sh "used_pct=\(.context_window.used_percentage // "")",
+  @sh "ctx_size=\(.context_window.context_window_size // 200000)",
+  @sh "total_in=\(.context_window.total_input_tokens // 0)",
+  @sh "total_out=\(.context_window.total_output_tokens // 0)"
+' 2>/dev/null)"
+
+block_json=""
+if command -v ccusage &>/dev/null; then
+  block_json=$(ccusage blocks --active --json 2>/dev/null)
+fi
+
+block_tokens="0"
+block_remaining=""
+if [ -n "$block_json" ]; then
+  eval "$(echo "$block_json" | jq -r '
+    .blocks[0] // empty |
+    @sh "block_tokens=\(.totalTokens // 0)",
+    @sh "block_remaining=\(.projection.remainingMinutes // 0)"
+  ' 2>/dev/null)"
+fi
+
+# --- Color palette (unified) ---
+RST='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+W='\033[38;5;255m'              # white (primary text)
+G1='\033[38;5;245m'             # gray (labels, secondary)
+G2='\033[38;5;239m'             # dark gray (bar empty, separators)
+BLUE='\033[38;5;75m'            # blue (bar fill default)
+ORANGE='\033[38;5;215m'         # orange (60%+ bar, out tokens)
+RED='\033[38;5;203m'            # red (80%+ bar)
+GREEN='\033[38;5;114m'          # green (in tokens)
+TEAL='\033[38;5;109m'           # teal (remaining time)
+LAVENDER='\033[38;5;141m'       # lavender (model name)
+
+# --- Helpers ---
+fmt_k() {
+  echo "$1" | awk '{
+    v = ($1=="" ? 0 : $1+0)
+    if      (v >= 1000000) printf "%.1fM", v/1000000
+    else if (v >= 1000)    printf "%.1fK", v/1000
+    else                   print  v
+  }'
+}
+
+make_bar() {
+  local pct_int="$1" width="$2"
+  local fc="${BLUE}"
+  [ "$pct_int" -ge 60 ] && fc="${ORANGE}"
+  [ "$pct_int" -ge 80 ] && fc="${RED}"
+  read f e <<< "$(awk "BEGIN { f=int($pct_int/100*$width+0.5); if(f>$width)f=$width; if(f<0)f=0; print f, $width-f }")"
+  local bf="" be=""
+  for i in $(seq 1 "$f"); do bf="${bf}━"; done
+  for i in $(seq 1 "$e"); do be="${be}─"; done
+  printf '%b' "${fc}${bf}${G2}${be}${RST}"
+}
+
+# --- Pre-format ---
+total_in_fmt=$(fmt_k "$total_in")
+total_out_fmt=$(fmt_k "$total_out")
+block_tokens_fmt=$(fmt_k "$block_tokens")
+limit_fmt=$(fmt_k "$SESSION_TOKEN_LIMIT")
+
+# ════════════════════════════════════════
+# Line 1: 대화
+# ════════════════════════════════════════
+line1="${W}${BOLD}대화${RST}  "
+
+pct1=0
+if [ -n "$used_pct" ]; then
+  pct1=$(echo "$used_pct" | awk '{printf "%d", $1+0.5}')
+fi
+line1="${line1}$(make_bar "$pct1" 20) ${W}${pct1}%${RST}"
+line1="${line1}   ${GREEN}↑${total_in_fmt}${RST} ${ORANGE}↓${total_out_fmt}${RST}"
+line1="${line1}   ${LAVENDER}${model}${RST}"
+
+# ════════════════════════════════════════
+# Line 2: 세션
+# ════════════════════════════════════════
+line2=""
+if [ "$block_tokens" != "0" ]; then
+  block_pct=$(awk "BEGIN { p=$block_tokens/$SESSION_TOKEN_LIMIT*100; if(p>100)p=100; printf \"%d\",p }")
+
+  remain_str=""
+  if [ -n "$block_remaining" ] && [ "$block_remaining" != "0" ]; then
+    remain_str=$(echo "$block_remaining" | awk '{
+      m = int($1+0.5)
+      if (m >= 60) printf "%dh%dm", int(m/60), m%60
+      else printf "%dm", m
+    }')
+  fi
+
+  line2="${W}${BOLD}세션${RST}  "
+  line2="${line2}$(make_bar "$block_pct" 20) ${W}${block_pct}%${RST}"
+  line2="${line2}   ${W}${BOLD}${block_tokens_fmt}${RST} ${G1}/ ${limit_fmt}${RST}"
+  if [ -n "$remain_str" ]; then
+    line2="${line2}   ${TEAL}${remain_str} 남음${RST}"
+  fi
+fi
+
+# --- Output ---
+if [ -n "$line2" ]; then
+  printf '%b\n%b' "$line1" "$line2"
+else
+  printf '%b' "$line1"
+fi
